@@ -1,0 +1,192 @@
+apiVersion: v1
+data:
+  main.py: "import asyncio\nimport json\nimport os\nimport uuid\nimport logging\nfrom
+    datetime import datetime\nfrom contextlib import asynccontextmanager\n\nimport
+    aiomysql\nfrom aiokafka import AIOKafkaConsumer, AIOKafkaProducer\nfrom fastapi
+    import FastAPI, HTTPException\nfrom fastapi.responses import HTMLResponse\nfrom
+    motor.motor_asyncio import AsyncIOMotorClient\nfrom pydantic import BaseModel\n\nlogging.basicConfig(level=logging.INFO)\nlogger
+    = logging.getLogger(\"cqrs-app\")\n\nMARIADB_HOST = os.getenv(\"MARIADB_HOST\",
+    \"mariadb-svc\")\nMARIADB_PORT = int(os.getenv(\"MARIADB_PORT\", \"3306\"))\nMARIADB_USER
+    = os.getenv(\"MARIADB_USER\", \"user\")\nMARIADB_PASSWORD = os.getenv(\"MARIADB_PASSWORD\",
+    \"password\")\nMARIADB_DB = os.getenv(\"MARIADB_DB\", \"orders_db\")\n\nMONGO_URI
+    = os.getenv(\"MONGO_URI\", \"mongodb://mongo-svc:27017\")\nMONGO_DB = os.getenv(\"MONGO_DB\",
+    \"read_db\")\n\nKAFKA_BOOTSTRAP = os.getenv(\"KAFKA_BOOTSTRAP_SERVERS\", \"kafka-svc:9092\")\nKAFKA_TOPIC
+    = os.getenv(\"KAFKA_TOPIC\", \"order-events\")\n\ndb_pool = None\nmongo_client
+    = None\nmongo_db = None\nproducer = None\n\nclass CreateOrderRequest(BaseModel):\n
+    \   customer: str\n    item: str\n    quantity: int\n    amount: float\n\nasync
+    def kafka_consumer_worker():\n    consumer = AIOKafkaConsumer(\n        KAFKA_TOPIC,\n
+    \       bootstrap_servers=KAFKA_BOOTSTRAP,\n        group_id=\"order-sync-group\",\n
+    \       auto_offset_reset=\"earliest\",\n        enable_auto_commit=True,\n        value_deserializer=lambda
+    m: json.loads(m.decode(\"utf-8\")),\n    )\n    while True:\n        try:\n            await
+    consumer.start()\n            logger.info(\"Kafka consumer connected successfully.\")\n
+    \           break\n        except Exception as e:\n            logger.warning(f\"Waiting
+    for Kafka broker...: {e}\")\n            await asyncio.sleep(2)\n\n    try:\n
+    \       async for msg in consumer:\n            try:\n                event =
+    msg.value\n                await mongo_db.orders.update_one(\n                    {\"id\":
+    event[\"id\"]},\n                    {\"$set\": event},\n                    upsert=True,\n
+    \               )\n            except Exception as e:\n                logger.error(f\"Error
+    syncing to MongoDB: {e}\")\n    finally:\n        await consumer.stop()\n\nasync
+    def safe_kafka_send(topic: str, payload: dict):\n    \"\"\"카프카 브로커 장애가 발생해도 메인
+    웹 스레드를 블로킹하지 않는 안전 전송 루틴\"\"\"\n    try:\n        if producer:\n            await
+    producer.send_and_wait(topic, payload)\n    except Exception as e:\n        logger.error(f\"Failed
+    to publish event to Kafka (Async): {e}\")\n\n@asynccontextmanager\nasync def lifespan(app:
+    FastAPI):\n    global db_pool, mongo_client, mongo_db, producer\n\n    for attempt
+    in range(1, 31):\n        try:\n            db_pool = await aiomysql.create_pool(\n
+    \               host=MARIADB_HOST,\n                port=MARIADB_PORT,\n                user=MARIADB_USER,\n
+    \               password=MARIADB_PASSWORD,\n                db=MARIADB_DB,\n                autocommit=True,\n
+    \           )\n            logger.info(\"MariaDB connected successfully.\")\n
+    \           break\n        except Exception as e:\n            logger.warning(f\"Waiting
+    for MariaDB ({attempt}/30)...: {e}\")\n            await asyncio.sleep(2)\n    else:\n
+    \       raise RuntimeError(\"Failed to connect to MariaDB after 30 attempts\")\n\n
+    \   async with db_pool.acquire() as conn:\n        async with conn.cursor() as
+    cur:\n            await cur.execute(\"\"\"\n                CREATE TABLE IF NOT
+    EXISTS orders (\n                    id VARCHAR(64) PRIMARY KEY,\n                    customer
+    VARCHAR(64),\n                    item VARCHAR(128),\n                    quantity
+    INT,\n                    amount DOUBLE,\n                    status VARCHAR(32),\n
+    \                   created_at VARCHAR(64)\n                )\n            \"\"\")\n
+    \           # 기존 배포에서 이미 생성된 테이블에도 신규 컬럼을 안전하게 추가\n            await cur.execute(\"ALTER
+    TABLE orders ADD COLUMN IF NOT EXISTS item VARCHAR(128) DEFAULT ''\")\n            await
+    cur.execute(\"ALTER TABLE orders ADD COLUMN IF NOT EXISTS quantity INT DEFAULT
+    1\")\n\n    mongo_client = AsyncIOMotorClient(MONGO_URI)\n    mongo_db = mongo_client[MONGO_DB]\n\n
+    \   producer = AIOKafkaProducer(\n        bootstrap_servers=KAFKA_BOOTSTRAP,\n
+    \       value_serializer=lambda v: json.dumps(v).encode(\"utf-8\"),\n    )\n    try:\n
+    \       await producer.start()\n    except Exception as e:\n        logger.warning(f\"Kafka
+    producer initial connect deferred: {e}\")\n\n    consumer_task = asyncio.create_task(kafka_consumer_worker())\n\n
+    \   yield\n\n    consumer_task.cancel()\n    if producer:\n        await producer.stop()\n
+    \   mongo_client.close()\n    db_pool.close()\n    await db_pool.wait_closed()\n\napp
+    = FastAPI(lifespan=lifespan)\n\n@app.get(\"/healthz\")\nasync def healthz():\n
+    \   return {\"ok\": True}\n\n@app.get(\"/\", response_class=HTMLResponse)\nasync
+    def web_index():\n    # 최신 생성일자 역순(내림차순, -1)으로 정렬하여 최근 데이터가 최상단에 노출\n    orders
+    = await mongo_db.orders.find().sort(\"created_at\", -1).to_list(300)\n    \n    rows
+    = \"\".join([\n        f\"<tr><td><code>{o.get('id')[:8]}...</code></td><td><b>{o.get('customer')}</b></td><td>{o.get('item')}</td><td>{o.get('quantity')}</td><td>{o.get('amount'):,.1f}</td><td><span
+    style='color:green; font-weight:600;'>{o.get('status')}</span></td><td>{o.get('created_at')}</td></tr>\"\n
+    \       for o in orders\n    ])\n    \n    total_count = len(orders)\n    \n    html
+    = f\"\"\"\n    <!DOCTYPE html>\n    <html>\n    <head>\n        <meta charset=\"utf-8\">\n
+    \       <title>CQRS 클라우드 주문 시스템</title>\n        <style>\n            body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    margin: 30px auto; max-width: 960px; background: #f8fafc; color: #1e293b; }}\n
+    \           .card {{ background: white; padding: 24px; border-radius: 12px; box-shadow:
+    0 4px 12px rgba(0,0,0,0.05); margin-bottom: 24px; border: 1px solid #e2e8f0; }}\n
+    \           input, button {{ padding: 10px 14px; margin-right: 8px; border-radius:
+    6px; border: 1px solid #cbd5e1; font-size: 14px; }}\n            button {{ background:
+    #2563eb; color: white; border: none; cursor: pointer; font-weight: 600; transition:
+    0.2s; }}\n            button:hover {{ background: #1d4ed8; }}\n            table
+    {{ width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px;
+    }}\n            th, td {{ padding: 12px 14px; border-bottom: 1px solid #e2e8f0;
+    text-align: left; }}\n            th {{ background: #f1f5f9; color: #475569; font-weight:
+    600; }}\n            .badge {{ background: #e0f2fe; color: #0369a1; padding: 4px
+    8px; border-radius: 4px; font-size: 12px; font-weight: 600; }}\n        </style>\n
+    \   </head>\n    <body>\n        <div class=\"card\">\n            <h2>CQRS 실시간
+    주문 시스템</h2>\n            <p style=\"color: #64748b; font-size: 13px;\">[Command
+    Write] MariaDB ➔ [Event Stream] Kafka ➔ [Query Read] MongoDB</p>\n            <form
+    onsubmit=\"event.preventDefault(); submitOrder();\">\n                <input id=\"customer\"
+    placeholder=\"고객명\" required />\n                <input id=\"item\" placeholder=\"상품명\"
+    required />\n                <input id=\"quantity\" type=\"number\" step=\"1\"
+    min=\"1\" placeholder=\"수량\" required />\n                <input id=\"amount\"
+    type=\"number\" step=\"any\" placeholder=\"금액\" required />\n                <button
+    type=\"submit\">주문 생성</button>\n                <button type=\"button\" style=\"background:#64748b;\"
+    onclick=\"window.location.reload();\">새로고침</button>\n            </form>\n        </div>\n\n
+    \       <div class=\"card\">\n            <div style=\"display:flex; justify-content:space-between;
+    align-items:center;\">\n                <h3>Read Model (MongoDB) 동기화 내역</h3>\n
+    \               <span class=\"badge\">총 동기화: {total_count} 건</span>\n            </div>\n
+    \           <table>\n                <thead>\n                    <tr><th>주문 ID
+    (Prefix)</th><th>고객명</th><th>상품명</th><th>수량</th><th>금액</th><th>상태</th><th>생성일시</th></tr>\n
+    \               </thead>\n                <tbody id=\"order-rows\">\n                    {rows
+    if rows else '<tr><td colspan=\"7\" align=\"center\" style=\"color:#94a3b8; padding:24px;\">주문
+    내역이 없습니다.</td></tr>'}\n                </tbody>\n            </table>\n        </div>\n\n
+    \       <script>\n            async function submitOrder() {{\n                const
+    customer = document.getElementById('customer').value;\n                const item
+    = document.getElementById('item').value;\n                const quantity = parseInt(document.getElementById('quantity').value,
+    10);\n                const amount = parseFloat(document.getElementById('amount').value);\n
+    \               await fetch('/orders', {{\n                    method: 'POST',\n
+    \                   headers: {{ 'Content-Type': 'application/json' }},\n                    body:
+    JSON.stringify({{ customer, item, quantity, amount }})\n                }});\n
+    \               document.getElementById('customer').value = '';\n                document.getElementById('item').value
+    = '';\n                document.getElementById('quantity').value = '';\n                document.getElementById('amount').value
+    = '';\n                setTimeout(() => window.location.reload(), 500);\n            }}\n
+    \       </script>\n    </body>\n    </html>\n    \"\"\"\n    return HTMLResponse(content=html)\n\n@app.post(\"/orders\",
+    status_code=201)\nasync def create_order(payload: CreateOrderRequest):\n    order_id
+    = str(uuid.uuid4())\n    created_at = datetime.utcnow().isoformat()\n    status
+    = \"CREATED\"\n\n    # 1. MariaDB (Command 저장소)에 쓰기\n    async with db_pool.acquire()
+    as conn:\n        async with conn.cursor() as cur:\n            await cur.execute(\n
+    \               \"INSERT INTO orders (id, customer, item, quantity, amount, status,
+    created_at) VALUES (%s, %s, %s, %s, %s, %s, %s)\",\n                (order_id,
+    payload.customer, payload.item, payload.quantity, payload.amount, status, created_at),\n
+    \           )\n\n    event_payload = {\n        \"id\": order_id,\n        \"customer\":
+    payload.customer,\n        \"item\": payload.item,\n        \"quantity\": payload.quantity,\n
+    \       \"amount\": payload.amount,\n        \"status\": status,\n        \"created_at\":
+    created_at,\n    }\n\n    # 2. Kafka 전송을 논블로킹 백그라운드 태스크로 처리하여 사용자 응답 속도 보장\n    asyncio.create_task(safe_kafka_send(KAFKA_TOPIC,
+    event_payload))\n    return event_payload\n\n@app.get(\"/orders\")\nasync def
+    get_order(id: str):\n    order = await mongo_db.orders.find_one({\"id\": id},
+    {\"_id\": 0})\n    if not order:\n        raise HTTPException(status_code=404,
+    detail=\"Order not found in Read DB\")\n    return order\n"
+kind: ConfigMap
+metadata:
+  name: fastapi-code
+  namespace: k8s-assign
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-app-svc
+  namespace: k8s-assign
+spec:
+  type: ClusterIP
+  selector:
+    app: fastapi-app
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi-app
+  namespace: k8s-assign
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fastapi-app
+  template:
+    metadata:
+      labels:
+        app: fastapi-app
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: fastapi-app
+          image: juyeon13241/fastapi-cqrs:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          envFrom:
+            - secretRef:
+                name: cqrs-secret
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: code-volume
+              mountPath: /app/main.py
+              subPath: main.py
+      volumes:
+        - name: code-volume
+          configMap:
+            name: fastapi-code
