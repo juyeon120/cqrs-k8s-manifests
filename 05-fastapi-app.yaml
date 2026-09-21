@@ -44,7 +44,7 @@ spec:
       containers:
         - name: fastapi-app
           # The application code is baked into this image by the CI pipeline; the tag is bumped by Jenkins.
-          image: juyeon13241/fastapi-cqrs:latest
+          image: juyeon13241/fastapi-cqrs:8266700f
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
